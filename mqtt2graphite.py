@@ -1,4 +1,4 @@
-#!/usr/bin/env python2.7
+#!/usr/bin/env python3
 
 __author__ = "Jan-Piet Mens"
 __copyright__ = "Copyright (C) 2013 by Jan-Piet Mens"
@@ -7,6 +7,7 @@ import paho.mqtt.client as paho
 import ssl
 import os, sys
 import logging
+import logging.handlers
 import time
 import socket
 import json
@@ -14,16 +15,27 @@ import signal
 
 MQTT_HOST = os.environ.get('MQTT_HOST', '127.0.0.1')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', 1883))
-CARBON_SERVER = os.environ.get('CARBON_SERVER', '127.0.0.1')
+CARBON_SERVER = os.environ.get('CARBON_SERVER', '192.168.2.43')
 CARBON_PORT = int(os.environ.get('CARBON_PORT', 2003))
+SYSLOG_HOST = os.environ.get('SYSLOG_HOST', None)
+SYSLOG_PORT = int(os.environ.get('SYSLOG_PORT', 1514))
 
-LOGFORMAT = '%(asctime)-15s %(message)s'
+LOGFORMAT = 'mqtt2graphite %(asctime)-15s %(message)s'
 
-DEBUG = os.environ.get('DEBUG', True)
+PREFIX = 'tasmota'
+
+DEVICES = ('pompa', ) # "topic" from tasmota
+
+DEBUG = os.environ.get('DEBUG', False)
 if DEBUG:
     logging.basicConfig(level=logging.DEBUG, format=LOGFORMAT)
 else:
     logging.basicConfig(level=logging.INFO, format=LOGFORMAT)
+
+if SYSLOG_HOST:
+    logger = logging.getLogger()
+    handler = logging.handlers.SysLogHandler(address=(SYSLOG_HOST, SYSLOG_PORT))
+    logger.addHandler(handler)
 
 client_id = "MQTT2Graphite_%d-%s" % (os.getpid(), socket.getfqdn())
 
@@ -51,67 +63,46 @@ def on_connect(mosq, userdata, flags, rc):
 
     mqttc.publish("/clients/" + client_id, "Online")
 
-    map = userdata['map']
-    for topic in map:
-        logging.debug("Subscribing to topic %s" % topic)
-        mqttc.subscribe(topic, 0)
+    for device in DEVICES:
+        for topic in (
+                'tele/%s/SENSOR' % device,
+                'stat/%s/POWER' % device,
+                ):
+            logging.debug("Subscribing to topic %s" % topic)
+            mqttc.subscribe(topic, 0)
 
 def on_message(mosq, userdata, msg):
+    try:
+        lines = []
+        now = int(time.time())
+        message = ''
 
-    sock = userdata['sock']
-    lines = []
-    now = int(time.time())
+        logging.debug(msg.topic)
+        logging.debug(msg.payload)
 
-    map = userdata['map']
-    # Find out how to handle the topic in this message: slurp through
-    # our map 
-    for t in map:
-        if paho.topic_matches_sub(t, msg.topic):
-            # print "%s matches MAP(%s) => %s" % (msg.topic, t, map[t])
+        parts = msg.topic.split('/')
+        device = parts[1]
 
-            # Must we rename the received msg topic into a different
-            # name for Carbon? In any case, replace MQTT slashes (/)
-            # by Carbon periods (.)
-            (type, remap) = map[t]
-            if remap is None:
-                carbonkey = msg.topic.replace('/', '.')
-            else:
-                if '#' in remap:
-                    remap = remap.replace('#', msg.topic.replace('/', '.'))
-                carbonkey = remap.replace('/', '.')
-            logging.debug("CARBONKEY is [%s]" % carbonkey)
+        if msg.topic.endswith('/POWER'):
+            message = '%s.%s.on %d %d\n' % (PREFIX, device, 1 if msg.payload == b'ON' else 0, now)
+        elif msg.topic.endswith('/SENSOR'):
+            payload = json.loads(msg.payload.decode('utf8'))
+            energy = payload['ENERGY']
+            for k, v in energy.items():
+                if not is_number(v):
+                    continue
+                message += '%s.%s.%s %s %d\n' % (PREFIX, device, k, v, now)
 
-            if type == 'n':
-                '''Number: obtain a float from the payload'''
-                try:
-                    number = float(msg.payload)
-                    lines.append("%s %f %d" % (carbonkey, number, now))
-                except ValueError:
-                    logging.info("Topic %s contains non-numeric payload [%s]" % 
-                            (msg.topic, msg.payload))
-                    return
 
-            elif type == 'j':
-                '''JSON: try and load the JSON string from payload and use
-                   subkeys to pass to Carbon'''
-                try:
-                    st = json.loads(msg.payload)
-                    for k in st:
-                        if is_number(st[k]):
-                            lines.append("%s.%s %f %d" % (carbonkey, k, float(st[k]), now))
-                except:
-                    logging.info("Topic %s contains non-JSON payload [%s]" %
-                            (msg.topic, msg.payload))
-                    return
+        logging.debug("%s", message)
 
-            else:
-                logging.info("Unknown mapping key [%s]", type)
-                return
-
-            message = '\n'.join(lines) + '\n'
-            logging.debug("%s", message)
-
-            sock.sendto(message, (CARBON_SERVER, CARBON_PORT))
+        sock = socket.socket()
+        sock.connect((CARBON_SERVER, CARBON_PORT))
+        sock.sendall(message.encode('utf8'))
+        sock.close()
+    except Exception as e:
+        import traceback
+        logging.warning(traceback.print_exc())
   
 def on_subscribe(mosq, userdata, mid, granted_qos):
     pass
@@ -129,34 +120,7 @@ def main():
     logging.info("INFO MODE")
     logging.debug("DEBUG MODE")
 
-    map = {}
-    if len(sys.argv) > 1:
-        map_file = sys.argv[1]
-    else:
-        map_file = 'map'
-
-    f = open(map_file)
-    for line in f.readlines():
-        line = line.rstrip()
-        if len(line) == 0 or line[0] == '#':
-            continue
-        remap = None
-        try:
-            type, topic, remap = line.split()
-        except ValueError:
-            type, topic = line.split()
-
-        map[topic] = (type, remap)
-
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    except:
-        sys.stderr.write("Can't create UDP socket\n")
-        sys.exit(1)
-
     userdata = {
-        'sock'      : sock,
-        'map'       : map,
     }
     global mqttc
     mqttc = paho.Client(client_id, clean_session=True, userdata=userdata)
